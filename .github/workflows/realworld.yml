@@ -1,0 +1,95 @@
+name: real-world-databases
+on:
+  push:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  PGHOST: 127.0.0.1
+  PGUSER: postgres
+  PG16: /usr/lib/postgresql/16/bin
+jobs:
+  gitlab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Postgres 16 clusters
+        run: |
+          [ -x "$PG16/initdb" ] || sudo apt-get install -y -q postgresql-16
+          bash start-clusters.sh "$PG16"
+      - name: Load GitLab production schema (db/structure.sql)
+        run: |
+          curl -sfL -o structure.sql https://gitlab.com/gitlab-org/gitlab/-/raw/master/db/structure.sql
+          createdb -p 55432 gitlab
+          psql -X -q -p 55432 -d gitlab -v ON_ERROR_STOP=1 -f structure.sql > /dev/null
+      - name: Drill
+        run: DRILL_DB=gitlab ruby drill2.rb 2>&1 | grep -v '^NOTICE' | tee -a $GITHUB_STEP_SUMMARY; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-gitlab, path: results-*.json }
+
+  mastodon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Postgres 16 clusters + Redis
+        run: |
+          [ -x "$PG16/initdb" ] || sudo apt-get install -y -q postgresql-16
+          bash start-clusters.sh "$PG16"
+          docker run -d --network host --name redis redis:7-alpine > /dev/null
+      - name: Mastodon creates its own database, then real activity
+        run: |
+          createdb -p 55432 mastodon
+          cat > seed.rb <<'RUBY'
+          alice = Account.find_local("alice"); bob = Account.find_local("bob")
+          FollowService.new.call(bob, alice)
+          30.times { |i| PostStatusService.new.call(alice, text: "hello world #{i} #drill") }
+          10.times { |i| s = PostStatusService.new.call(bob, text: "reply #{i}"); FavouriteService.new.call(alice, s) }
+          puts "accounts=#{Account.count} statuses=#{Status.count} follows=#{Follow.count} favourites=#{Favourite.count}"
+          RUBY
+          docker run --rm --network host -v "$PWD/seed.rb:/opt/seed.rb:ro" \
+            -e RAILS_ENV=production -e LOCAL_DOMAIN=example.com -e DISABLE_DATABASE_ENVIRONMENT_CHECK=1 -e ES_ENABLED=false \
+            -e DB_HOST=127.0.0.1 -e DB_PORT=55432 -e DB_USER=postgres -e DB_PASS= -e DB_NAME=mastodon \
+            -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=6379 \
+            -e SECRET_KEY_BASE=$(openssl rand -hex 64) -e OTP_SECRET=$(openssl rand -hex 64) \
+            -e ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY=$(openssl rand -hex 16) \
+            -e ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT=$(openssl rand -hex 16) \
+            -e ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY=$(openssl rand -hex 16) \
+            ghcr.io/mastodon/mastodon:v4.7.2 bash -c '
+              set -e
+              bundle exec rails db:setup
+              bin/tootctl accounts create alice --email alice@example.com --confirmed
+              bin/tootctl accounts create bob --email bob@example.com --confirmed
+              bundle exec rails runner /opt/seed.rb'
+      - name: Drill
+        run: DRILL_DB=mastodon ruby drill2.rb 2>&1 | grep -v '^NOTICE' | tee -a $GITHUB_STEP_SUMMARY; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-mastodon, path: results-*.json }
+
+  pg-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build Postgres 16.15 from source
+        run: |
+          sudo apt-get install -y -q libreadline-dev zlib1g-dev flex bison > /dev/null
+          curl -sfL https://ftp.postgresql.org/pub/source/v16.15/postgresql-16.15.tar.bz2 | tar xj
+          cd postgresql-16.15
+          ./configure --prefix=$HOME/pg --without-icu > /dev/null
+          make -s -j4 > /dev/null && make -s install > /dev/null && make -s -C contrib/amcheck install > /dev/null
+      - name: Clusters + Postgres regression suite (leaves the "regression" database)
+        run: |
+          bash start-clusters.sh "$HOME/pg/bin"
+          export PATH=$HOME/pg/bin:$PATH PGPORT=55432
+          make -C postgresql-16.15/src/test/regress installcheck > regress.log 2>&1 || echo "some regression tests failed (expected to be harmless here)"
+          tail -3 regress.log
+      - name: Drill
+        run: DRILL_DB=regression ruby drill2.rb 2>&1 | grep -v '^NOTICE' | tee -a $GITHUB_STEP_SUMMARY; exit ${PIPESTATUS[0]}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results-regression, path: results-*.json }

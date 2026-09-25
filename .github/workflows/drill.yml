@@ -1,7 +1,6 @@
 name: restore-drill-prototype
 on:
-  push:
-  workflow_dispatch:
+  workflow_dispatch: {}
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
