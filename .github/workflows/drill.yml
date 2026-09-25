@@ -1,0 +1,68 @@
+name: restore-drill-prototype
+on:
+  push:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      prod:
+        image: postgres:16
+        env: { POSTGRES_HOST_AUTH_METHOD: trust }
+        ports: ["55432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+      target:
+        image: postgres:16
+        env: { POSTGRES_HOST_AUTH_METHOD: trust }
+        ports: ["55433:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 30
+    env:
+      PGHOST: 127.0.0.1
+      PGUSER: postgres
+    steps:
+      - uses: actions/checkout@v5
+      - name: Runner specs
+        run: |
+          echo "cpus=$(nproc) mem=$(free -h | awk '/Mem/{print $2}')" | tee -a $GITHUB_STEP_SUMMARY
+          df -h / | tee -a $GITHUB_STEP_SUMMARY
+          pg_dump --version; ruby -v
+      - name: Load Pagila into "production"
+        run: |
+          REF=e0e35a666f
+          curl -sfLO https://raw.githubusercontent.com/devrimgunduz/pagila/$REF/pagila-schema.sql
+          curl -sfLO https://raw.githubusercontent.com/devrimgunduz/pagila/$REF/pagila-data.sql
+          createdb -p 55432 pagila
+          psql -q -X -p 55432 -d pagila -v ON_ERROR_STOP=1 -f pagila-schema.sql > /dev/null
+          psql -q -X -p 55432 -d pagila -v ON_ERROR_STOP=1 -f pagila-data.sql > /dev/null
+      - name: Drill (7 scenarios)
+        run: |
+          ruby drill.rb 2>&1 | grep -v '^NOTICE' | tee drill.txt
+          { echo '```'; cat drill.txt; echo '```'; } >> $GITHUB_STEP_SUMMARY
+          grep -q '7/7 scenarios classified correctly' drill.txt
+      - name: Scale test (realistic, low-compressibility data)
+        run: |
+          set -e
+          createdb -p 55432 big
+          t0=$(date +%s)
+          psql -X -q -p 55432 -d big -c "create table events (id bigserial primary key, user_ref text, payload text, created_at timestamptz)" \
+            -c "insert into events (user_ref, payload, created_at) select md5(random()::text), md5(random()::text) || md5(random()::text), now() - random() * interval '365 days' from generate_series(1, 8000000)" \
+            -c "create index on events (created_at)" -c "analyze"
+          echo "generate: $(( $(date +%s)-t0 ))s"
+          DB=$(psql -X -At -p 55432 -d big -c "select pg_size_pretty(pg_database_size('big'))")
+          t0=$(date +%s); pg_dump -p 55432 -d big -Fc -f big.dump; DUMP_S=$(( $(date +%s)-t0 ))
+          SIZE=$(du -h big.dump | cut -f1)
+          createdb -p 55433 bigr
+          t0=$(date +%s); pg_restore -p 55433 -d bigr -j 4 --no-owner --exit-on-error big.dump; RESTORE_S=$(( $(date +%s)-t0 ))
+          t0=$(date +%s)
+          psql -X -q -p 55433 -d bigr -c "analyze" -c "create extension amcheck" -c "select bt_index_check('events_pkey'::regclass, true)" -c "select count(*) from events" > /dev/null
+          CHECK_S=$(( $(date +%s)-t0 ))
+          {
+            echo "| metric | value |"; echo "|---|---|"
+            echo "| db size | $DB (8M rows) |"; echo "| dump (-Fc) | ${DUMP_S}s, $SIZE |"
+            echo "| restore (-j4) | ${RESTORE_S}s |"; echo "| checks (analyze + amcheck heapallindexed + count) | ${CHECK_S}s |"
+          } | tee -a $GITHUB_STEP_SUMMARY
+          df -h / | tee -a $GITHUB_STEP_SUMMARY
