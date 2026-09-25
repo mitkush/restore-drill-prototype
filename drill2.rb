@@ -50,7 +50,8 @@ def fingerprint(t)
     select format('index %s', indexdef) from pg_indexes i join pg_namespace n on n.nspname = i.schemaname where #{USER_NS}
      union all
     select format('constraint %s %s %s', coalesce(nullif(k.conrelid, 0)::regclass::text, k.contypid::regtype::text), k.conname, pg_get_constraintdef(k.oid))
-      from pg_constraint k join pg_namespace n on n.oid = k.connamespace where #{USER_NS}
+      from pg_constraint k join pg_namespace n on n.oid = k.connamespace
+     where k.conparentid = 0 and #{USER_NS} -- partition clones are re-derived on restore under other names
      union all
     select format('%s %I.%I', case c.relkind when 'v' then 'view' when 'm' then 'matview' when 'S' then 'sequence' end, n.nspname, c.relname)
       from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('v','m','S') and #{USER_NS}
@@ -105,7 +106,9 @@ def amcheck(t)
   { checked: res.size, corrupt: corrupt.map { "#{_1['i']}: #{_1['err'][0, 140]}" }, skipped: skipped.map { "#{_1['i']}: #{_1['err'][0, 140]}" } }
 end
 
-def baseline = { schema: fingerprint(PROD), rows: row_counts(PROD), newest: newest(PROD), seqs: sequence_links(PROD) }
+def behind?(s) = s["max_id"].to_f.positive? && (s["last_value"].nil? || s["last_value"].to_f < s["max_id"].to_f)
+
+def baseline ={ schema: fingerprint(PROD), rows: row_counts(PROD), newest: newest(PROD), seqs: sequence_links(PROD) }
 
 def dump(name, *args)
   path = File.join(DUMPS, name)
@@ -146,10 +149,12 @@ def check(base, path, list: nil)
     f << ["CRITICAL", "freshness", "newest restored data is #{lag.round}s behind production (limit #{MAX_AGE_S}s)"]
   end
 
+  prod_seq = base[:seqs].to_h { [[_1["seq"], _1["col"]], _1] }
   sequence_links(TARGET).each do |s|
-    next unless s["max_id"] && s["max_id"].to_f.positive?
-    next unless s["last_value"].nil? || s["last_value"].to_f < s["max_id"].to_f
-    f << ["CRITICAL", "sequences", "#{s['seq']} at #{s['last_value'] || 'unset'} but #{s['col']} max is #{s['max_id']}"]
+    next unless behind?(s)
+    p = prod_seq[[s["seq"], s["col"]]]
+    next if p && behind?(p) && p["last_value"].to_f <= s["last_value"].to_f
+    f << ["CRITICAL", "sequences", "#{s['seq']} at #{s['last_value'] || 'unset'} (production: #{p ? p['last_value'] || 'unset' : '?'}) but #{s['col']} max is #{s['max_id']} → next INSERT fails"]
   end
 
   a = amcheck(TARGET)
@@ -186,6 +191,8 @@ psql(PROD, "insert into public.zz_drill_heartbeat values (now())")
 good = dump("good.dump")
 base = baseline
 puts "PROD #{PROD[:db]}: #{base[:rows].size} tables, #{base[:rows].values.compact.sum} rows, #{base[:schema].size} schema objects, #{base[:seqs].size} sequence-linked columns"
+pre = base[:seqs].select { behind?(_1) }
+puts "[production info] #{pre.size} sequences are already behind their column in production (not a backup problem), e.g. #{pre.first(2).map { "#{_1['seq']}=#{_1['last_value'] || 'unset'} < max #{_1['max_id']}" }.join(', ')}" if pre.any?
 report("A healthy backup", "PASS", *check(base, good))
 
 File.binwrite(File.join(DUMPS, "truncated.dump"), File.binread(good)[0, (File.size(good) * 0.6).to_i])

@@ -44,7 +44,14 @@ jobs:
         run: |
           createdb -p 55432 mastodon
           cat > seed.rb <<'RUBY'
-          alice = Account.find_local("alice"); bob = Account.find_local("bob")
+          # production mode rejects test email domains (MX check), so skip validation for seed users only
+          mk = ->(name) do
+            u = User.new(email: "#{name}@example.com", password: SecureRandom.hex(16), agreement: true,
+                         confirmed_at: Time.now.utc, approved: true, account: Account.new(username: name))
+            u.save!(validate: false)
+            u.account
+          end
+          alice = mk.("alice"); bob = mk.("bob")
           FollowService.new.call(bob, alice)
           30.times { |i| PostStatusService.new.call(alice, text: "hello world #{i} #drill") }
           10.times { |i| s = PostStatusService.new.call(bob, text: "reply #{i}"); FavouriteService.new.call(alice, s) }
@@ -61,8 +68,6 @@ jobs:
             ghcr.io/mastodon/mastodon:v4.7.2 bash -c '
               set -e
               bundle exec rails db:setup
-              bin/tootctl accounts create alice --email alice@example.com --confirmed
-              bin/tootctl accounts create bob --email bob@example.com --confirmed
               bundle exec rails runner /opt/seed.rb'
       - name: Drill
         run: DRILL_DB=mastodon ruby drill2.rb 2>&1 | grep -v '^NOTICE' | tee -a $GITHUB_STEP_SUMMARY; exit ${PIPESTATUS[0]}
